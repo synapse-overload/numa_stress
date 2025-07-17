@@ -15,7 +15,7 @@ constexpr int TOTAL_NODES = 16;                // 0-15 on this platform
 
 /* ───────────────── helpers ───────────────── */
 
-static std::size_t cache_line() {
+static std::size_t get_cache_line() {
   std::ifstream f(
       "/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size");
   std::size_t v = 64;
@@ -52,7 +52,7 @@ static void pin_to_node(int node) {
 /* ───────────────── worker ───────────────── */
 
 struct stats {
-  double gbps = 0;
+  size_t mb = 0;
 };
 
 std::mutex out_mtx;
@@ -62,19 +62,16 @@ static void worker(int remote_node, std::size_t secs, const std::size_t line,
   // TODO: some nice scope-guard style error handling would be better
   numa_set_strict(1);
 
-  void *raw_buf = nullptr;
-  // allocate on cache line boundary
-  // so that we favor full line writes
-  if (posix_memalign(&raw_buf, line, ARRAY_SIZE) != 0) {
-    std::cerr << "aligned allocation failed\n";
+  // TODO: in this case the value of ARRAY_SIZE is hardcoded at 1GB which
+  // can be evenly divided by the page size, but something more portable would
+  // validate the requested array size as a multiple of the page size and adjust
+  // accordingly, otherwise you won't know what size to pass to numa_free
+  void *raw_buf = numa_alloc_onnode(ARRAY_SIZE, remote_node);
+
+  if (raw_buf == nullptr) {
+    std::cerr << "Could not allocate memory on remote node " << remote_node <<'\n';
     std::exit(1);
   }
-
-  // since the allocation with memalign never faulted a page into existence
-  // the following policy-based assignment will work, otherwise, if a write
-  // happens before this to any of the pages referred to by the prev posix
-  // memalign => kaboom
-  numa_tonode_memory(raw_buf, ARRAY_SIZE, remote_node);
 
   // ASSERT correct alignment of start of buffer memory
   // TODO: maybe wrap this in a nice wrapper that can be disabled
@@ -96,7 +93,7 @@ static void worker(int remote_node, std::size_t secs, const std::size_t line,
 
   if (effective_array_size < line) {
     std::cerr << "Effective array size too small after alignment correction\n";
-    free(raw_buf);
+    numa_free(raw_buf, ARRAY_SIZE);
     std::exit(1);
   }
 
@@ -109,13 +106,13 @@ static void worker(int remote_node, std::size_t secs, const std::size_t line,
   if (move_pages(0, 1, &sample_page, NULL, &status, MPOL_MF_MOVE) != 0) {
     // handle errno reporting via perror, not cerr but whatever
     perror("move_pages verification failed");
-    free(raw_buf);
+    numa_free(raw_buf, ARRAY_SIZE);
     std::exit(1);
   }
   if (status != remote_node) {
     std::cerr << "Page not on target node " << remote_node << " (got " << status
               << ")\n";
-    free(raw_buf);
+    numa_free(raw_buf, ARRAY_SIZE);
     std::exit(1);
   }
 
@@ -135,21 +132,22 @@ static void worker(int remote_node, std::size_t secs, const std::size_t line,
 
 #if USE_ASM_AVX512
     __m512i pattern = _mm512_set1_epi8(static_cast<char>(val));
-    asm volatile("vmovdqa64 %[val], (%[addr])\n\t" // Single 64-byte write
+    asm volatile("vmovntdq %[val], (%[addr])\n\t" // Single 64-byte write
                  :                                 // No outputs
-                 : [addr] "r"(array + offset), [val] "v"(pattern) // "v" for ZMM
+                 : [addr] "r"(buf + offset), [val] "v"(pattern) // "v" for ZMM
                  : "memory");
 
     /* advance */
 #elif USE_ASM_SSE
+    __m128i value128 = _mm_set1_epi8(val);
     asm volatile(
-        "movdqa %[val], (%[addr])\n\t" // Write 16 bytes (XMM register)
-        "movdqa %[val], 16(%[addr])\n\t"
-        "movdqa %[val], 32(%[addr])\n\t"
-        "movdqa %[val], 48(%[addr])\n\t" // Completes 64 bytes
+        "movntdq %[val], (%[addr])\n\t" // Write 16 bytes (XMM register)
+        "movntdq %[val], 16(%[addr])\n\t"
+        "movntdq %[val], 32(%[addr])\n\t"
+        "movntdq %[val], 48(%[addr])\n\t" // Completes 64 bytes
         // Optional: clflush (%[addr]) for flush or movntdq for non-temporal
         :                                               // No outputs
-        : [addr] "r"(array + line), [val] "x"(value128) // "x" for XMM
+        : [addr] "r"(buf + offset), [val] "x"(value128) // "x" for XMM
         : "memory"                                      // Memory clobber
     );
 #else
@@ -185,7 +183,7 @@ static void worker(int remote_node, std::size_t secs, const std::size_t line,
     }
   }
 
-  st.gbps = double(bytes) / (1ULL << 30) / secs;
+  st.mb += bytes / (1ULL << 20);
   numa_free(buf, ARRAY_SIZE);
 }
 
@@ -202,7 +200,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   const std::size_t run_secs = parse_secs(argv[1]);
-  const std::size_t line = cache_line(); // 64 B on SKX
+  const std::size_t line = get_cache_line(); // 64 B on SKX
   if (ARRAY_SIZE % line) {
     std::cerr << "ARRAY_SIZE must be multiple of cache line\n";
     return 1;
@@ -217,15 +215,22 @@ int main(int argc, char **argv) {
       rem.push_back(n);
 
   std::vector<stats> all(rem.size());
-  std::vector<std::jthread> th;
+  std::vector<std::thread> th;
 
+  const auto gstart = std::chrono::steady_clock::now();;
   for (std::size_t i = 0; i < rem.size(); ++i)
     th.emplace_back(worker, rem[i], run_secs, line, std::ref(all[i]));
 
-  th.clear(); // joins
+  for (auto &jt: th) {
+    jt.join();
+  }
+  const auto gend = std::chrono::steady_clock::now();
+
+  th.clear();
 
   double agg = 0;
   for (auto &s : all)
-    agg += s.gbps;
-  std::cout << "\naggregate write bandwidth: " << agg << " GB/s\n";
+    agg += s.mb;
+  auto time_elapsed = std::chrono::duration_cast<std::chrono::seconds>(gend - gstart).count();
+  std::cout << "\naggregate write bandwidth: " << agg / time_elapsed << " MB/s\n";
 }

@@ -1,2 +1,8 @@
-numa_stress:
-	g++ -std=c++20 -O2 -mavx512f -pthread numa_stress.cc -lnuma -o numa_stress
+CXXFLAGS = -std=c++20 -O2 -mavx512f -pthread -lnuma
+LDFLAGS = -pthread -lnuma
+
+numa_stress: numa_stress.cc
+
+.PHONY: clean
+clean:
+	rm -f numa_stress
