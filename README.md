@@ -1,2 +1,2 @@
 # numa_stress
-An attemt of stressing multiple numa nodes from a single node
+An attempt of stressing multiple numa nodes from a single node
